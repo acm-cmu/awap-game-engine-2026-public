@@ -121,10 +121,7 @@ class BotPlayer:
 
         if self.current_order is None:
             for order in orders:
-                if (
-                    order["order_id"] not in self.fulfilled_orders
-                    and FoodType.EGG.food_name not in order["required"]
-                ):
+                if order["order_id"] not in self.fulfilled_orders:
                     self.current_order = order
                     print(f"Current order: {self.current_order}")
                     break
@@ -324,6 +321,8 @@ class BotPlayer:
                 if controller.place(bot_id, cx, cy):
                     if FoodType.MEAT.food_name in self.current_order["required"]:
                         self.state = States.WAIT_FOR_MEAT
+                    elif FoodType.EGG.food_name in self.current_order["required"]:
+                        self.state = States.WAIT_FOR_EGG
                     elif FoodType.ONIONS.food_name in self.current_order["required"]:
                         self.state = States.RETRIEVE_BOX_ITEM
                     elif FoodType.NOODLES.food_name in self.current_order["required"]:
