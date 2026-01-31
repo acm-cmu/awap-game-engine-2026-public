@@ -176,6 +176,105 @@ class GameState:
             Team.BLUE: [[None for _ in range(self.blue_map.height)] for _ in range(self.blue_map.width)],
         }
 
+    ####### Slider render
+    def from_dict(self, data: dict):
+        """Restore game state from dictionary"""
+        self.turn = data.get("turn", 0)
+        
+        # Restore money - fix: use team_money instead of money
+        money_data = data.get("money", {})
+        self.team_money = {
+            Team.RED: money_data.get("RED", 0),
+            Team.BLUE: money_data.get("BLUE", 0)
+        }
+        
+        # Clear current occupancy
+        for team in [Team.RED, Team.BLUE]:
+            for x in range(len(self.occupancy[team])):
+                for y in range(len(self.occupancy[team][x])):
+                    self.occupancy[team][x][y] = None
+        
+        # Helper function to get FoodType from name
+        def get_food_type(food_name: str) -> Optional[FoodType]:
+            """Look up FoodType enum by name"""
+            for ft in FoodType:
+                if ft.food_name == food_name:
+                    return ft
+            return None
+        
+        # Restore bots
+        self.bots = {}
+        bots_data = data.get("bots", {})
+        for bot_id_str, bot_data in bots_data.items():
+            bot_id = int(bot_id_str)
+            
+            # Create bot with basic info using BotState
+            team = Team[bot_data["team"]]
+            x = bot_data["x"]
+            y = bot_data["y"]
+            
+            bot = BotState(
+                bot_id=bot_id,
+                team=team,
+                x=x,
+                y=y,
+                holding=None
+            )
+            
+            # Restore holding item if any
+            if bot_data.get("holding"):
+                holding_data = bot_data["holding"]
+                
+                item_type = holding_data.get("type")
+                if item_type == "Food":
+                    food_type = get_food_type(holding_data["food_name"])
+                    if food_type:
+                        food = Food(food_type)
+                        if "cooked" in holding_data:
+                            food.cooked_stage = holding_data["cooked"]
+                        if "chopped" in holding_data:
+                            food.chopped = holding_data["chopped"]
+                        bot.holding = food
+                    
+                elif item_type == "Plate":
+                    plate = Plate()
+                    plate.dirty = holding_data.get("dirty", False)
+                    # Restore foods on plate
+                    for food_data in holding_data.get("food", []):
+                        food_type = get_food_type(food_data["food_name"])
+                        if food_type:
+                            food = Food(food_type)
+                            if "cooked" in food_data:
+                                food.cooked_stage = food_data["cooked"]
+                            if "chopped" in food_data:
+                                food.chopped = food_data["chopped"]
+                            plate.food.append(food)
+                    bot.holding = plate
+                    
+                elif item_type == "Pan":
+                    pan = Pan()
+                    if holding_data.get("food"):
+                        food_data = holding_data["food"]
+                        food_type = get_food_type(food_data["food_name"])
+                        if food_type:
+                            food = Food(food_type)
+                            if "cooked" in food_data:
+                                food.cooked_stage = food_data["cooked"]
+                            if "chopped" in food_data:
+                                food.chopped = food_data["chopped"]
+                            pan.food = food
+                    bot.holding = pan
+            
+            # Restore map_team if it exists
+            if "map_team" in bot_data:
+                bot.map_team = Team[bot_data["map_team"]]
+            else:
+                bot.map_team = team
+            
+            self.bots[bot_id] = bot
+            
+            # Update occupancy
+            self.occupancy[bot.map_team][x][y] = bot_id
 
     # -------------
     # Map helpers
@@ -566,75 +665,123 @@ class GameState:
     # Serialization
     # -----------------------
 
-    def to_dict(self) -> Dict[str, Any]:
-        def item_to_dict(it: Optional[Item]) -> Any:
-            if it is None:
-                return None
-            if isinstance(it, Food):
-                return {
-                    "type": "Food",
-                    "food_name": it.food_name,
-                    "food_id": it.food_id,
-                    "chopped": it.chopped,
-                    "cooked_stage": it.cooked_stage,
-                }
-            if isinstance(it, Plate):
-                return {
-                    "type": "Plate",
-                    "dirty": it.dirty,
-                    "food": [item_to_dict(f if isinstance(f, Food) else Food(f)) for f in it.food],
-                }
-            if isinstance(it, Pan):
-                return {"type": "Pan", "food": item_to_dict(it.food)}
-            return {"type": type(it).__name__}
+    # def to_dict(self) -> Dict[str, Any]:
+    #     def item_to_dict(it: Optional[Item]) -> Any:
+    #         if it is None:
+    #             return None
+    #         if isinstance(it, Food):
+    #             return {
+    #                 "type": "Food",
+    #                 "food_name": it.food_name,
+    #                 "food_id": it.food_id,
+    #                 "chopped": it.chopped,
+    #                 "cooked_stage": it.cooked_stage,
+    #             }
+    #         if isinstance(it, Plate):
+    #             return {
+    #                 "type": "Plate",
+    #                 "dirty": it.dirty,
+    #                 "food": [item_to_dict(f if isinstance(f, Food) else Food(f)) for f in it.food],
+    #             }
+    #         if isinstance(it, Pan):
+    #             return {"type": "Pan", "food": item_to_dict(it.food)}
+    #         return {"type": type(it).__name__}
 
-        bots_payload = [
-            {
-                "bot_id": bot_id,
-                "team": b.team.name,
-                "x": b.x,
-                "y": b.y,
-                "holding": item_to_dict(b.holding),
-                "map_team": getattr(b, "map_team", b.team).name,
+    #     bots_payload = [
+    #         {
+    #             "bot_id": bot_id,
+    #             "team": b.team.name,
+    #             "x": b.x,
+    #             "y": b.y,
+    #             "holding": item_to_dict(b.holding),
+    #             "map_team": getattr(b, "map_team", b.team).name,
+    #         }
+    #         for bot_id, b in self.bots.items()
+    #     ]
+
+    #     orders_payload = {
+    #         Team.RED.name: [
+    #             {
+    #                 "order_id": o.order_id,
+    #                 "required": [ft.food_name for ft in o.required],
+    #                 "created_turn": o.created_turn,
+    #                 "expires_turn": o.expires_turn,
+    #                 "reward": o.reward,
+    #                 "penalty": o.penalty,
+    #                 "claimed_by": o.claimed_by,
+    #                 "completed_turn": o.completed_turn,
+    #             }
+    #             for o in self.orders.get(Team.RED, [])
+    #         ],
+    #         Team.BLUE.name: [
+    #             {
+    #                 "order_id": o.order_id,
+    #                 "required": [ft.food_name for ft in o.required],
+    #                 "created_turn": o.created_turn,
+    #                 "expires_turn": o.expires_turn,
+    #                 "reward": o.reward,
+    #                 "penalty": o.penalty,
+    #                 "claimed_by": o.claimed_by,
+    #                 "completed_turn": o.completed_turn,
+    #             }
+    #             for o in self.orders.get(Team.BLUE, [])
+    #         ],
+    #     }
+
+
+    #     return {
+    #         "turn": self.turn,
+    #         "team_money": {Team.RED.name: self.get_team_money(Team.RED), Team.BLUE.name: self.get_team_money(Team.BLUE)},
+    #         "bots": bots_payload,
+    #         "orders": orders_payload,
+    #         "red_map": self.red_map.to_2d_list(),
+    #         "blue_map": self.blue_map.to_2d_list(),
+    #     }
+        
+    ######## Slider render
+    def to_dict(self) -> dict:
+        """Convert game state to dictionary for replay"""
+        bots_data = {}
+        for bot_id, bot in self.bots.items():
+            bot_dict = {
+                "team": bot.team.name,
+                "x": bot.x,
+                "y": bot.y,
             }
-            for bot_id, b in self.bots.items()
-        ]
-
-        orders_payload = {
-            Team.RED.name: [
-                {
-                    "order_id": o.order_id,
-                    "required": [ft.food_name for ft in o.required],
-                    "created_turn": o.created_turn,
-                    "expires_turn": o.expires_turn,
-                    "reward": o.reward,
-                    "penalty": o.penalty,
-                    "claimed_by": o.claimed_by,
-                    "completed_turn": o.completed_turn,
-                }
-                for o in self.orders.get(Team.RED, [])
-            ],
-            Team.BLUE.name: [
-                {
-                    "order_id": o.order_id,
-                    "required": [ft.food_name for ft in o.required],
-                    "created_turn": o.created_turn,
-                    "expires_turn": o.expires_turn,
-                    "reward": o.reward,
-                    "penalty": o.penalty,
-                    "claimed_by": o.claimed_by,
-                    "completed_turn": o.completed_turn,
-                }
-                for o in self.orders.get(Team.BLUE, [])
-            ],
-        }
-
-
+            
+            # Serialize holding item
+            if bot.holding:
+                if isinstance(bot.holding, Food):
+                    bot_dict["holding"] = {
+                        "type": "Food",
+                        "food_name": bot.holding.food_name,
+                        "cooked": getattr(bot.holding, "cooked_stage", 0)  # Fix: use cooked_stage
+                    }
+                elif isinstance(bot.holding, Plate):
+                    bot_dict["holding"] = {
+                        "type": "Plate",
+                        "dirty": bot.holding.dirty,
+                        "food": [{"food_name": f.food_name, "cooked": getattr(f, "cooked_stage", 0)} 
+                                for f in bot.holding.food if isinstance(f, Food)]
+                    }
+                elif isinstance(bot.holding, Pan):
+                    bot_dict["holding"] = {
+                        "type": "Pan",
+                        "food": {"food_name": bot.holding.food.food_name, 
+                                "cooked": getattr(bot.holding.food, "cooked_stage", 0)} 
+                                if bot.holding.food else None
+                    }
+            
+            if hasattr(bot, 'map_team'):
+                bot_dict["map_team"] = bot.map_team.name
+                
+            bots_data[str(bot_id)] = bot_dict
+        
         return {
             "turn": self.turn,
-            "team_money": {Team.RED.name: self.get_team_money(Team.RED), Team.BLUE.name: self.get_team_money(Team.BLUE)},
-            "bots": bots_payload,
-            "orders": orders_payload,
-            "red_map": self.red_map.to_2d_list(),
-            "blue_map": self.blue_map.to_2d_list(),
+            "money": {
+                "RED": self.team_money[Team.RED],  # Fix: use team_money
+                "BLUE": self.team_money[Team.BLUE]  # Fix: use team_money
+            },
+            "bots": bots_data,
         }

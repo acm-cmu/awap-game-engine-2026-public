@@ -60,7 +60,7 @@ class Game:
         replay_path: Optional[str] = None,
         render: bool = False,
         turn_limit: int = GameConstants.TOTAL_TURNS,
-        per_turn_timeout_s: float = 0.05,
+        per_turn_timeout_s: float = 0.5,
         fps_cap: int = 30,
     ):
         self.render_enabled = render
@@ -189,6 +189,88 @@ class Game:
             return True
         return self.renderer.render_once(fps_cap=self.fps_cap)
 
+
+    ######## Step through each frame
+
+    # def run_game(self) -> Optional[Team]:
+    #     '''run the game and return a winner'''
+
+    #     #needs init
+    #     if self.red_failed_init and self.blue_failed_init:
+    #         print("[GAME] Both bots failed to initialize.")
+    #         return None
+
+    #     #render init
+    #     if not self.render():
+    #         return None
+
+    #     # for _ in range(self.turn_limit):
+    #     #     #start turn (money + environment + expirations)
+    #     #     self.game_state.start_turn()
+
+    #     #     #call blue then red
+    #     #     blue_ok = self.call_player(Team.BLUE)
+    #     #     red_ok = self.call_player(Team.RED)
+
+    #     #     #record and render
+    #     #     self.record_turn()
+    #     #     if not self.render():
+    #     #         break
+    #     for _ in range(self.turn_limit):
+    #         # Keep rendering and checking for input until we should advance
+    #         while self.render_enabled and self.renderer is not None:
+    #             if not self.render():
+    #                 return None  # Window closed
+    #             if self.renderer.should_advance():
+    #                 break  # Ready to advance to next frame
+            
+    #         #start turn (money + environment + expirations)
+    #         self.game_state.start_turn()
+
+    #         #call blue then red
+    #         blue_ok = self.call_player(Team.BLUE)
+    #         red_ok = self.call_player(Team.RED)
+
+    #         #record and render
+    #         self.record_turn()
+
+    #         # if self.render_enabled and self.renderer is not None and not self.renderer.should_advance():
+    #         #     continue
+
+    #         #if one side crashes, then the other side wins by default
+    #         if not blue_ok and red_ok:
+    #             print("[GAME] BLUE failed, RED wins")
+    #             winner = Team.RED
+    #             self.export_replay(winner)
+    #             return winner
+    #         if not red_ok and blue_ok:
+    #             print("[GAME] RED failed, BLUE wins")
+    #             winner = Team.BLUE
+    #             self.export_replay(winner)
+    #             return winner
+    #         if not red_ok and not blue_ok:
+    #             print("[GAME] Both failed, no winner")
+    #             self.export_replay(None)
+    #             return None
+
+    #     red_money = self.game_state.get_team_money(Team.RED)
+    #     blue_money = self.game_state.get_team_money(Team.BLUE)
+        
+    #     print(f"[GAME OVER] money scores: RED=${red_money}, BLUE=${blue_money}")
+
+    #     if red_money > blue_money:
+    #         print(f"[RESULT] RED WINS by ${red_money - blue_money}!")
+    #         winner = Team.RED
+    #     elif blue_money > red_money:
+    #         print(f"[RESULT] BLUE WINS by ${blue_money - red_money}!")
+    #         winner = Team.BLUE
+    #     else:
+    #         print("[RESULT] DRAW")
+    #         winner = None
+
+    #     self.export_replay(winner)
+    #     return None
+
     def run_game(self) -> Optional[Team]:
         '''run the game and return a winner'''
 
@@ -197,11 +279,14 @@ class Game:
             print("[GAME] Both bots failed to initialize.")
             return None
 
-        #render init
-        if not self.render():
-            return None
+        # Store all game states
+        game_states = []
+        
+        # Record initial state
+        game_states.append(self.game_state.to_dict())
 
-        for _ in range(self.turn_limit):
+        # Run the entire game first to generate all frames
+        for turn_idx in range(self.turn_limit):
             #start turn (money + environment + expirations)
             self.game_state.start_turn()
 
@@ -209,44 +294,62 @@ class Game:
             blue_ok = self.call_player(Team.BLUE)
             red_ok = self.call_player(Team.RED)
 
-            #record and render
-            self.record_turn()
-            if not self.render():
-                break
+            #record state
+            game_states.append(self.game_state.to_dict())
 
             #if one side crashes, then the other side wins by default
             if not blue_ok and red_ok:
                 print("[GAME] BLUE failed, RED wins")
                 winner = Team.RED
-                self.export_replay(winner)
-                return winner
+                break
             if not red_ok and blue_ok:
                 print("[GAME] RED failed, BLUE wins")
                 winner = Team.BLUE
-                self.export_replay(winner)
-                return winner
+                break
             if not red_ok and not blue_ok:
                 print("[GAME] Both failed, no winner")
-                self.export_replay(None)
-                return None
-
-        red_money = self.game_state.get_team_money(Team.RED)
-        blue_money = self.game_state.get_team_money(Team.BLUE)
-        
-        print(f"[GAME OVER] money scores: RED=${red_money}, BLUE=${blue_money}")
-
-        if red_money > blue_money:
-            print(f"[RESULT] RED WINS by ${red_money - blue_money}!")
-            winner = Team.RED
-        elif blue_money > red_money:
-            print(f"[RESULT] BLUE WINS by ${blue_money - red_money}!")
-            winner = Team.BLUE
+                winner = None
+                break
         else:
-            print("[RESULT] DRAW")
-            winner = None
+            # Game completed all turns
+            red_money = self.game_state.get_team_money(Team.RED)
+            blue_money = self.game_state.get_team_money(Team.BLUE)
+            
+            print(f"[GAME OVER] money scores: RED=${red_money}, BLUE=${blue_money}")
 
+            if red_money > blue_money:
+                print(f"[RESULT] RED WINS by ${red_money - blue_money}!")
+                winner = Team.RED
+            elif blue_money > red_money:
+                print(f"[RESULT] BLUE WINS by ${blue_money - red_money}!")
+                winner = Team.BLUE
+            else:
+                print("[RESULT] DRAW")
+                winner = None
+
+        # Store replay
+        self.replay = game_states[1:]  # Skip initial state for replay
         self.export_replay(winner)
-        return None
+
+        # Now playback with slider
+        if self.render_enabled and self.renderer is not None:
+            max_frame = len(game_states) - 1
+            self.renderer.set_current_frame(0)
+            
+            while True:
+                target = self.renderer.get_target_frame()
+                
+                # Load the game state for the target frame
+                if 0 <= target < len(game_states):
+                    # Reconstruct game state from dict
+                    state_dict = game_states[target]
+                    self.game_state.from_dict(state_dict)
+                    self.renderer.set_current_frame(target)
+                
+                if not self.renderer.render_once(fps_cap=self.fps_cap, max_frame=max_frame):
+                    break
+
+        return winner
 
     def export_replay(self, winner: Optional[Team]):
         '''json dump'''
@@ -277,7 +380,7 @@ def main():
     ap.add_argument("--replay", default=None, help="optional output replay json path")
     ap.add_argument("--render", action="store_true", help="enable pygame rendering")
     ap.add_argument("--turns", type=int, default=GameConstants.TOTAL_TURNS, help="turn limit")
-    ap.add_argument("--timeout", type=float, default=0.05, help="per-turn timeout seconds per bot")
+    ap.add_argument("--timeout", type=float, default=0.5, help="per-turn timeout seconds per bot")
     ap.add_argument("--fps", type=int, default=30, help="fps cap when rendering")
     args = ap.parse_args()
 
