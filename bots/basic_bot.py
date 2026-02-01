@@ -1,8 +1,9 @@
+import heapq
 import itertools
 import random
 from collections import deque
 from enum import Enum, auto
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from game_constants import FoodType, ShopCosts, Team, TileType
 from item import Food, Pan, Plate
@@ -38,12 +39,15 @@ class States(Enum):
     PICKUP_PLATE = auto()
     SUBMIT_ORDER = auto()
     TRASH_ITEM = auto()
+    TRASH_PLATE = auto()  # Trash items from plate when order expires
+    DISCARD_PLATE = auto()  # Put empty plate on counter after trashing items
     RETRIEVE_BOX_ITEM = auto()
     PLATE_BOX_ITEM = auto()
 
 
 class BotWorkerState:
     """Per-bot state for independent order processing."""
+
     def __init__(self, bot_id: int):
         self.bot_id = bot_id
         self.state = States.INIT
@@ -64,17 +68,49 @@ class BotPlayer:
         self.claimed_orders: set[int] = set()  # Orders claimed by any bot
         self.worker_states: dict[int, BotWorkerState] = {}  # Per-bot state
 
-    def get_bfs_path(
-        self, controller: RobotController, start: Tuple[int, int], target_predicate,
-        avoid_positions: Optional[Set[Tuple[int, int]]] = None
+    def get_proximity_cost(
+        self, pos: Tuple[int, int], other_bots: Set[Tuple[int, int]]
+    ) -> float:
+        """Calculate a soft penalty for being near other bots.
+        Returns 0 if no bots nearby, increasing cost for closer proximity.
+        """
+        if not other_bots:
+            return 0
+        x, y = pos
+        cost = 0.0
+        for bx, by in other_bots:
+            dist = max(abs(x - bx), abs(y - by))  # Chebyshev distance
+            if dist == 0:
+                cost += 5.0  # High cost for exact position
+            elif dist == 1:
+                cost += 2.0  # Medium cost for adjacent
+            elif dist == 2:
+                cost += 0.5  # Small cost for 2 tiles away
+        return cost
+
+    def get_weighted_path(
+        self,
+        controller: RobotController,
+        start: Tuple[int, int],
+        target_predicate,
+        other_bot_positions: Optional[Set[Tuple[int, int]]] = None,
     ) -> Optional[Tuple[int, int]]:
-        avoid_positions = avoid_positions or set()
-        queue = deque([(start, [])])
-        visited = set([start])
+        """Find path using Dijkstra's algorithm with proximity costs.
+        Bots prefer to avoid each other but can pass through if needed.
+        """
+        other_bot_positions = other_bot_positions or set()
+        # Priority queue: (cost, x, y, path)
+        pq = [(0.0, start[0], start[1], [])]
+        visited: Dict[Tuple[int, int], float] = {}
         w, h = self.map.width, self.map.height
 
-        while queue:
-            (curr_x, curr_y), path = queue.popleft()
+        while pq:
+            cost, curr_x, curr_y, path = heapq.heappop(pq)
+
+            if (curr_x, curr_y) in visited:
+                continue
+            visited[(curr_x, curr_y)] = cost
+
             tile = controller.get_tile(controller.get_team(), curr_x, curr_y)
             if target_predicate(curr_x, curr_y, tile):
                 if not path:
@@ -87,22 +123,25 @@ class BotPlayer:
                         continue
                     nx, ny = curr_x + dx, curr_y + dy
                     if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in visited:
-                        if self.map.is_tile_walkable(nx, ny) and (nx, ny) not in avoid_positions:
-                            visited.add((nx, ny))
-                            queue.append(((nx, ny), path + [(dx, dy)]))
+                        if self.map.is_tile_walkable(nx, ny):
+                            # Base move cost is 1, plus proximity penalty
+                            move_cost = 1.0 + self.get_proximity_cost(
+                                (nx, ny), other_bot_positions
+                            )
+                            new_cost = cost + move_cost
+                            heapq.heappush(pq, (new_cost, nx, ny, path + [(dx, dy)]))
         return None
 
     def get_other_bot_positions(
         self, controller: RobotController, exclude_bot_id: int
     ) -> Set[Tuple[int, int]]:
-        """Get positions of all other bots to avoid collisions."""
+        """Get positions of all other bots for proximity-aware pathfinding."""
         positions = set()
-        for team in [Team.RED, Team.BLUE]:
-            for bid in controller.get_team_bot_ids(team):
-                if bid != exclude_bot_id:
-                    state = controller.get_bot_state(bid)
-                    if state:
-                        positions.add((state["x"], state["y"]))
+        for bid in controller.get_team_bot_ids(controller.get_team()):
+            if bid != exclude_bot_id:
+                state = controller.get_bot_state(bid)
+                if state:
+                    positions.add((state["x"], state["y"]))
         return positions
 
     def move_randomly(
@@ -111,7 +150,7 @@ class BotPlayer:
         """Move in a random valid direction to get unstuck."""
         bot_state = controller.get_bot_state(bot_id)
         bx, by = bot_state["x"], bot_state["y"]
-        
+
         possible = []
         for dx, dy in itertools.product([-1, 0, 1], [-1, 0, 1]):
             if dx == 0 and dy == 0:
@@ -119,41 +158,69 @@ class BotPlayer:
             nx, ny = bx + dx, by + dy
             if self.map.is_tile_walkable(nx, ny) and (nx, ny) not in avoid:
                 possible.append((dx, dy))
-        
+
         if possible:
             dx, dy = random.choice(possible)
             controller.move(bot_id, dx, dy)
             return True
         return False
 
+    def is_blocking_position(self, x: int, y: int) -> bool:
+        """Check if a position is in a narrow area that could block other bots.
+        Returns True if the position has 3 or fewer walkable neighbors (corridor-like).
+        """
+        walkable_neighbors = 0
+        for dx, dy in itertools.product([-1, 0, 1], [-1, 0, 1]):
+            if dx == 0 and dy == 0:
+                continue
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < self.map.width and 0 <= ny < self.map.height:
+                if self.map.is_tile_walkable(nx, ny):
+                    walkable_neighbors += 1
+        # If 3 or fewer walkable neighbors, it's a narrow/blocking spot
+        return walkable_neighbors <= 3
+
+    def count_stuck_workers(self) -> int:
+        """Count how many workers are currently stuck."""
+        return sum(1 for w in self.worker_states.values() if w.stuck_turns >= 5)
+
     def move_towards(
-        self, controller: RobotController, bot_id: int, target_x: int, target_y: int,
-        avoid_positions: Optional[Set[Tuple[int, int]]] = None
+        self,
+        controller: RobotController,
+        bot_id: int,
+        target_x: int,
+        target_y: int,
+        other_bot_positions: Optional[Set[Tuple[int, int]]] = None,
     ) -> bool:
         bot_state = controller.get_bot_state(bot_id)
         bx, by = bot_state["x"], bot_state["y"]
-        avoid_positions = avoid_positions or set()
+        other_bot_positions = other_bot_positions or set()
 
         def is_adjacent_to_target(x, y, tile):
             return max(abs(x - target_x), abs(y - target_y)) <= 1
 
         if is_adjacent_to_target(bx, by, None):
             return True
-        step = self.get_bfs_path(controller, (bx, by), is_adjacent_to_target, avoid_positions)
-        if step and (step[0] != 0 or step[1] != 0):
-            controller.move(bot_id, step[0], step[1])
-            return False
-        # If no path found, try without avoidance as fallback
-        step = self.get_bfs_path(controller, (bx, by), is_adjacent_to_target)
+
+        # Use weighted pathfinding that prefers avoiding other bots but doesn't hard-block
+        step = self.get_weighted_path(
+            controller, (bx, by), is_adjacent_to_target, other_bot_positions
+        )
         if step and (step[0] != 0 or step[1] != 0):
             controller.move(bot_id, step[0], step[1])
             return False
         return False
 
     def find_nearest_tile(
-        self, controller: RobotController, bot_x: int, bot_y: int, tile_name: str
+        self,
+        controller: RobotController,
+        bot_x: int,
+        bot_y: int,
+        tile_name: str,
+        avoid_positions: Optional[Set[Tuple[int, int]]] = None,
     ) -> Optional[Tuple[int, int]]:
         """Find nearest tile of given type using BFS (actual walking distance)."""
+        avoid_positions = avoid_positions or set()
         queue = deque([(bot_x, bot_y, 0)])
         visited = {(bot_x, bot_y)}
         w, h = self.map.width, self.map.height
@@ -175,6 +242,34 @@ class BotPlayer:
                         continue
                     nx, ny = cx + dx, cy + dy
                     if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in visited:
+                        if (
+                            self.map.is_tile_walkable(nx, ny)
+                            and (nx, ny) not in avoid_positions
+                        ):
+                            visited.add((nx, ny))
+                            queue.append((nx, ny, dist + 1))
+        return None
+
+    def _bfs_distance(
+        self, start_x: int, start_y: int, target_x: int, target_y: int
+    ) -> Optional[int]:
+        """Calculate BFS distance from start to a position adjacent to target."""
+        if max(abs(start_x - target_x), abs(start_y - target_y)) <= 1:
+            return 0
+        queue = deque([(start_x, start_y, 0)])
+        visited = {(start_x, start_y)}
+        w, h = self.map.width, self.map.height
+
+        while queue:
+            cx, cy, dist = queue.popleft()
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    if dx == 0 and dy == 0:
+                        continue
+                    nx, ny = cx + dx, cy + dy
+                    if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in visited:
+                        if max(abs(nx - target_x), abs(ny - target_y)) <= 1:
+                            return dist + 1
                         if self.map.is_tile_walkable(nx, ny):
                             visited.add((nx, ny))
                             queue.append((nx, ny, dist + 1))
@@ -187,15 +282,43 @@ class BotPlayer:
         bot_y: int,
         tile_names: List[str],
         exclude: Optional[List[Tuple[int, int]]] = None,
+        avoid_positions: Optional[Set[Tuple[int, int]]] = None,
+        max_distance_from: Optional[Tuple[Tuple[int, int], int]] = None,
     ) -> Optional[Tuple[int, int]]:
-        """Find nearest tile matching any of the given types using BFS, excluding specified positions."""
+        """Find nearest tile matching any of the given types using BFS, excluding specified positions.
+
+        Args:
+            max_distance_from: Optional tuple of ((x, y), max_dist) - if provided, only return
+                               tiles that are within max_dist BFS moves from the given position.
+
+        If multiple tiles are found at the same distance, prefers tiles with more walkable
+        neighbors (more accessible locations). Tiles with only 1 walkable neighbor get +2 distance penalty.
+        """
         exclude = exclude or []
+        avoid_positions = avoid_positions or set()
         queue = deque([(bot_x, bot_y, 0)])
         visited = {(bot_x, bot_y)}
         w, h = self.map.width, self.map.height
 
+        def count_walkable_neighbors(pos: Tuple[int, int]) -> int:
+            px, py = pos
+            count = 0
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    if dx == 0 and dy == 0:
+                        continue
+                    nx, ny = px + dx, py + dy
+                    if 0 <= nx < w and 0 <= ny < h:
+                        if self.map.is_tile_walkable(nx, ny):
+                            count += 1
+            return count
+
+        # Collect all candidates with their effective distances
+        candidates = []
+
         while queue:
             cx, cy, dist = queue.popleft()
+
             # Check adjacent tiles for the target types
             for dx in [-1, 0, 1]:
                 for dy in [-1, 0, 1]:
@@ -203,7 +326,23 @@ class BotPlayer:
                     if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in exclude:
                         tile = self.map.tiles[nx][ny]
                         if tile.tile_name in tile_names:
-                            return (nx, ny)
+                            # Check max_distance_from constraint if provided
+                            if max_distance_from:
+                                ref_pos, max_dist = max_distance_from
+                                dist_from_ref = self._bfs_distance(
+                                    ref_pos[0], ref_pos[1], nx, ny
+                                )
+                                if dist_from_ref is None or dist_from_ref > max_dist:
+                                    continue  # Skip this tile, too far from reference
+                            # Calculate effective distance with penalty for tight spaces
+                            effective_dist = dist
+                            if count_walkable_neighbors((nx, ny)) <= 2:
+                                effective_dist += (
+                                    3  # Penalty for tiles with only 1 floor around
+                                )
+                            if (nx, ny) not in [c[0] for c in candidates]:
+                                candidates.append(((nx, ny), effective_dist))
+
             # Expand to walkable neighbors
             for dx in [-1, 0, 1]:
                 for dy in [-1, 0, 1]:
@@ -211,10 +350,19 @@ class BotPlayer:
                         continue
                     nx, ny = cx + dx, cy + dy
                     if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in visited:
-                        if self.map.is_tile_walkable(nx, ny):
+                        if (
+                            self.map.is_tile_walkable(nx, ny)
+                            and (nx, ny) not in avoid_positions
+                        ):
                             visited.add((nx, ny))
                             queue.append((nx, ny, dist + 1))
-        return None
+
+        if not candidates:
+            return None
+
+        # Sort by effective distance (ascending), then by walkable neighbors (descending) for ties
+        candidates.sort(key=lambda c: (c[1], -count_walkable_neighbors(c[0])))
+        return candidates[0][0]
 
     def calculate_ingredient_cost(self, ingredient_list: List[str]) -> int:
         total_cost = 0
@@ -288,7 +436,7 @@ class BotPlayer:
         # Run each bot independently
         for i, bot_id in enumerate(my_bots):
             worker = self.worker_states[bot_id]
-            
+
             # Select order if none
             if worker.current_order is None:
                 self.select_next_order(controller, worker)
@@ -296,17 +444,33 @@ class BotPlayer:
                     continue
 
             # Get exclusions (tiles claimed by other bots)
-            other_counters = [ws.counter_loc for ws in self.worker_states.values() 
-                           if ws.bot_id != bot_id and ws.counter_loc]
-            other_cookers = [ws.cooker_loc for ws in self.worker_states.values() 
-                           if ws.bot_id != bot_id and ws.cooker_loc]
-            other_boxes = [ws.box_loc for ws in self.worker_states.values() 
-                         if ws.bot_id != bot_id and ws.box_loc]
+            other_counters = [
+                ws.counter_loc
+                for ws in self.worker_states.values()
+                if ws.bot_id != bot_id and ws.counter_loc
+            ]
+            other_cookers = [
+                ws.cooker_loc
+                for ws in self.worker_states.values()
+                if ws.bot_id != bot_id and ws.cooker_loc
+            ]
+            other_boxes = [
+                ws.box_loc
+                for ws in self.worker_states.values()
+                if ws.bot_id != bot_id and ws.box_loc
+            ] + other_counters
 
-            # Get other bot positions for collision avoidance
+            # Get other bot positions for proximity-aware pathfinding
             other_bot_positions = self.get_other_bot_positions(controller, bot_id)
-            
-            self.run_worker(controller, worker, other_counters, other_cookers, other_boxes, other_bot_positions)
+
+            self.run_worker(
+                controller,
+                worker,
+                other_counters,
+                other_cookers,
+                other_boxes,
+                other_bot_positions,
+            )
 
     def run_worker(
         self,
@@ -319,7 +483,9 @@ class BotPlayer:
     ) -> None:
         """Run the state machine for a single bot worker."""
         if worker.last_state != worker.state:
-            print(f"t={controller.get_turn()} Bot {worker.bot_id} state: {worker.state}")
+            print(
+                f"t={controller.get_turn()} Bot {worker.bot_id} state: {worker.state}"
+            )
             worker.last_state = worker.state
 
         bot_id = worker.bot_id
@@ -327,37 +493,70 @@ class BotPlayer:
         if bot_info is None:
             return
         bx, by = bot_info["x"], bot_info["y"]
-        
-        # Stuck detection: if bot hasn't moved in 5 turns, move randomly
+
+        # Stuck detection: if bot hasn't moved in 5 turns, consider moving randomly
         current_pos = (bx, by)
         if worker.last_pos == current_pos:
             worker.stuck_turns += 1
         else:
             worker.stuck_turns = 0
             worker.last_pos = current_pos
-        
+
         if worker.stuck_turns >= 5:
-            print(f"Bot {bot_id} is stuck, moving randomly")
-            if self.move_randomly(controller, bot_id, other_bot_positions):
-                worker.stuck_turns = 0
-                return
+            # Only move randomly if:
+            # 1. We're in a blocking position (narrow corridor), OR
+            # 2. Multiple bots are stuck (deadlock)
+            is_blocking = self.is_blocking_position(bx, by)
+            num_stuck = self.count_stuck_workers()
+
+            if is_blocking or num_stuck >= 2:
+                print(
+                    f"Bot {bot_id} is stuck (blocking={is_blocking}, num_stuck={num_stuck}), moving randomly"
+                )
+                if self.move_randomly(controller, bot_id, other_bot_positions):
+                    worker.stuck_turns = 0
+                    return
+            # Otherwise, just wait in place - we're not blocking anyone
 
         # Find workstations for this bot, excluding ones claimed by others
+        # First find shop to use as reference for cooker distance constraint
+        shop_pos = self.find_nearest_tile(controller, bx, by, "SHOP")
+
         if worker.counter_loc is None:
+            # Only consider counters within 19 moves of the shop
             worker.counter_loc = self.find_nearest_tile_of_types(
-                controller, bx, by, ["COUNTER"], exclude=exclude_counters
+                controller,
+                bx,
+                by,
+                ["COUNTER"],
+                exclude=exclude_counters,
+                avoid_positions=other_bot_positions,
+                max_distance_from=(shop_pos, 16) if shop_pos else None,
             )
         if worker.cooker_loc is None:
+            # Only consider cookers within 19 moves of the shop
             worker.cooker_loc = self.find_nearest_tile_of_types(
-                controller, bx, by, ["COOKER"], exclude=exclude_cookers
+                controller,
+                bx,
+                by,
+                ["COOKER"],
+                exclude=exclude_cookers,
+                avoid_positions=other_bot_positions,
+                max_distance_from=(shop_pos, 19) if shop_pos else None,
             )
         if worker.counter_loc is None or worker.cooker_loc is None:
             return
         if worker.box_loc is None:
             all_exclude = exclude_boxes + [worker.counter_loc, worker.cooker_loc]
             worker.box_loc = self.find_nearest_tile_of_types(
-                controller, bx, by, ["BOX", "COUNTER"], exclude=all_exclude
+                controller,
+                bx,
+                by,
+                ["BOX", "COUNTER"],
+                exclude=all_exclude,
+                avoid_positions=other_bot_positions,
             )
+        # print(f"Bot {bot_id} counter at {worker.counter_loc}, cooker at {worker.cooker_loc}, box at {worker.box_loc}")
 
         if worker.box_loc is None:
             return
@@ -663,8 +862,8 @@ class BotPlayer:
                 return
             ux, uy = submit_pos
             if controller.get_turn() > worker.current_order["expires_turn"]:
-                # order expired, trash plate
-                worker.state = States.TRASH_ITEM
+                # order expired, trash plate items then discard plate
+                worker.state = States.TRASH_PLATE
                 return
             elif self.move_towards(controller, bot_id, ux, uy, other_bot_positions):
                 if controller.submit(bot_id, ux, uy):
@@ -672,6 +871,10 @@ class BotPlayer:
                     self.fulfilled_orders.add(worker.current_order["order_id"])
                     self.claimed_orders.discard(worker.current_order["order_id"])
                     worker.current_order = None
+                    # Reset workstation locations for next order
+                    worker.counter_loc = None
+                    worker.cooker_loc = None
+                    worker.box_loc = None
 
         elif worker.state == States.TRASH_ITEM:
             trash_pos = self.find_nearest_tile(controller, bx, by, "TRASH")
@@ -684,3 +887,33 @@ class BotPlayer:
                     if worker.current_order:
                         self.claimed_orders.discard(worker.current_order["order_id"])
                     worker.current_order = None
+                    # Reset workstation locations for next order
+                    worker.counter_loc = None
+                    worker.cooker_loc = None
+                    worker.box_loc = None
+
+        elif worker.state == States.TRASH_PLATE:
+            # Trash the items on the plate, then put the empty plate on a counter
+            trash_pos = self.find_nearest_tile(controller, bx, by, "TRASH")
+            if not trash_pos:
+                return
+            tx, ty = trash_pos
+            if self.move_towards(controller, bot_id, tx, ty, other_bot_positions):
+                if controller.trash(bot_id, tx, ty):
+                    # After trashing items, discard the empty plate
+                    worker.state = States.DISCARD_PLATE
+
+        elif worker.state == States.DISCARD_PLATE:
+            # Put the empty plate on a counter (can't trash empty plates)
+            # Find any counter to place it on
+            px, py = worker.counter_loc
+            if self.move_towards(controller, bot_id, px, py, other_bot_positions):
+                if controller.place(bot_id, px, py):
+                    worker.state = States.INIT
+                    if worker.current_order:
+                        self.claimed_orders.discard(worker.current_order["order_id"])
+                    worker.current_order = None
+                    # Reset workstation locations for next order
+                    worker.counter_loc = None
+                    worker.cooker_loc = None
+                    worker.box_loc = None
