@@ -1,44 +1,45 @@
 import itertools
 import random
 from collections import deque
-from enum import Enum
+from enum import Enum, auto
 from typing import List, Optional, Set, Tuple
 
 from game_constants import FoodType, ShopCosts, Team, TileType
 from item import Food, Pan, Plate
 from robot_controller import RobotController
+from time import time
 
 
 class States(Enum):
-    INIT = 0
-    BUY_PAN = 1
-    BUY_MEAT = 2
-    PUT_MEAT_ON_COUNTER = 3
-    CHOP_MEAT = 4
-    PICKUP_MEAT = 5
-    PUT_MEAT_ON_COOKER = 6
-    BUY_EGG = 7
-    PUT_EGG_ON_COOKER = 8
-    BUY_ONIONS = 9
-    PUT_ONIONS_ON_COUNTER = 10
-    CHOP_ONIONS = 11
-    PICKUP_CHOPPED_ONIONS = 12
-    STORE_CHOPPED_ONIONS = 13
-    BUY_PLATE = 14
-    PUT_PLATE_ON_COUNTER = 15
-    BUY_NOODLES = 16
-    ADD_NOODLES_TO_PLATE = 17
-    BUY_SAUCE = 18
-    ADD_SAUCE_TO_PLATE = 19
-    WAIT_FOR_MEAT = 20
-    ADD_MEAT_TO_PLATE = 21
-    WAIT_FOR_EGG = 22
-    ADD_EGG_TO_PLATE = 23
-    PICKUP_PLATE = 24
-    SUBMIT_ORDER = 25
-    TRASH_ITEM = 26
-    RETRIEVE_BOX_ITEM = 27
-    PLATE_BOX_ITEM = 28
+    INIT = auto()
+    BUY_PAN = auto()
+    BUY_MEAT = auto()
+    PUT_MEAT_ON_COUNTER = auto()
+    CHOP_MEAT = auto()
+    PICKUP_MEAT = auto()
+    PUT_MEAT_ON_COOKER = auto()
+    BUY_EGG = auto()
+    PUT_EGG_ON_COOKER = auto()
+    BUY_ONIONS = auto()
+    PUT_ONIONS_ON_COUNTER = auto()
+    CHOP_ONIONS = auto()
+    PICKUP_CHOPPED_ONIONS = auto()
+    STORE_CHOPPED_ONIONS = auto()
+    BUY_PLATE = auto()
+    PUT_PLATE_ON_COUNTER = auto()
+    BUY_NOODLES = auto()
+    ADD_NOODLES_TO_PLATE = auto()
+    BUY_SAUCE = auto()
+    ADD_SAUCE_TO_PLATE = auto()
+    WAIT_FOR_MEAT = auto()
+    ADD_MEAT_TO_PLATE = auto()
+    WAIT_FOR_EGG = auto()
+    ADD_EGG_TO_PLATE = auto()
+    PICKUP_PLATE = auto()
+    SUBMIT_ORDER = auto()
+    TRASH_ITEM = auto()
+    RETRIEVE_BOX_ITEM = auto()
+    PLATE_BOX_ITEM = auto()
 
 
 class BotPlayer:
@@ -54,6 +55,7 @@ class BotPlayer:
         self.cooker_timer = None
 
         self.state = States.INIT
+        self.last_state = None
 
     def get_bfs_path(
         self, controller: RobotController, start: Tuple[int, int], target_predicate
@@ -76,7 +78,7 @@ class BotPlayer:
                         continue
                     nx, ny = curr_x + dx, curr_y + dy
                     if 0 <= nx < w and 0 <= ny < h and (nx, ny) not in visited:
-                        if controller.get_map(controller.get_team()).is_tile_walkable(
+                        if self.map.is_tile_walkable(
                             nx, ny
                         ):
                             visited.add((nx, ny))
@@ -116,17 +118,50 @@ class BotPlayer:
                         best_pos = (x, y)
         return best_pos
 
+    def calculate_ingredient_cost(self, ingredient_list: List[str]) -> int:
+        total_cost = 0
+        for ingredient in ingredient_list:
+            if ingredient == FoodType.MEAT.food_name:
+                total_cost += FoodType.MEAT.buy_cost
+            elif ingredient == FoodType.EGG.food_name:
+                total_cost += FoodType.EGG.buy_cost
+            elif ingredient == FoodType.ONIONS.food_name:
+                total_cost += FoodType.ONIONS.buy_cost
+            elif ingredient == FoodType.NOODLES.food_name:
+                total_cost += FoodType.NOODLES.buy_cost
+            elif ingredient == FoodType.SAUCE.food_name:
+                total_cost += FoodType.SAUCE.buy_cost
+        return total_cost
+    
+    def select_next_order(self, controller: RobotController):
+        orders = controller.get_orders(controller.get_team())
+        best_order = None
+        best_value = -float('inf')
+        team_money = controller.get_team_money(controller.get_team())
+
+        for order in orders:
+            if order["order_id"] in self.fulfilled_orders:
+                continue
+            time_remaining = order["expires_turn"] - controller.get_turn()
+            if time_remaining <= 0:
+                continue
+            ingredient_cost = self.calculate_ingredient_cost(order["required"])
+            value = order["reward"] - ingredient_cost
+            if value > best_value and team_money >= ingredient_cost:
+                best_value = value
+                best_order = order
+
+        self.current_order = best_order
+        if self.current_order:
+            print(f"Selected order: {self.current_order}")
+
     def play_turn(self, controller: RobotController):
         orders = controller.get_orders(controller.get_team())
 
         if self.current_order is None:
-            for order in orders:
-                if order["order_id"] not in self.fulfilled_orders:
-                    self.current_order = order
-                    print(f"Current order: {self.current_order}")
-                    break
-            else:
-                return  # No available orders
+            self.select_next_order(controller)
+            if self.current_order is None:
+                return
 
         my_bots = controller.get_team_bot_ids(controller.get_team())
         if not my_bots:
@@ -141,9 +176,9 @@ class BotPlayer:
         controller: RobotController,
         my_bots,
     ) -> None:
-        # This sort of assumes that the bot has time to chop and store onions and grab a
-        # plate before the meat is done cooking
-        print(f"Current state: {self.state}")
+        if self.last_state != self.state:
+            print(f"Current state: {self.state}")
+            self.last_state = self.state
 
         bot_id = self.my_bot_id
         if bot_id is None:
@@ -185,16 +220,12 @@ class BotPlayer:
                 and FoodType.EGG.food_name not in self.current_order["required"]
             ) or (tile and isinstance(tile.item, Pan)):
                 if FoodType.ONIONS.food_name in self.current_order["required"]:
-                    print("Going to buy onions")
                     self.state = States.BUY_ONIONS
                 elif FoodType.MEAT.food_name in self.current_order["required"]:
-                    print("Going to buy meat")
                     self.state = States.BUY_MEAT
                 elif FoodType.EGG.food_name in self.current_order["required"]:
-                    print("Going to buy egg")
                     self.state = States.BUY_EGG
                 else:
-                    print("Going to buy plate")
                     self.state = States.BUY_PLATE
             else:
                 self.state = States.BUY_PAN
@@ -341,7 +372,6 @@ class BotPlayer:
                     if controller.buy(bot_id, FoodType.NOODLES, sx, sy):
                         self.state = States.ADD_NOODLES_TO_PLATE
 
-        # state 11: add noodles to plate
         elif self.state == States.ADD_NOODLES_TO_PLATE:
             if self.move_towards(controller, bot_id, cx, cy):
                 if controller.add_food_to_plate(bot_id, cx, cy):
@@ -366,7 +396,6 @@ class BotPlayer:
                 if controller.add_food_to_plate(bot_id, cx, cy):
                     self.state = States.PICKUP_PLATE
 
-        # state 12: wait and take meat
         elif self.state == States.WAIT_FOR_MEAT:
             if self.move_towards(controller, bot_id, kx, ky):
                 tile = controller.get_tile(controller.get_team(), kx, ky)
@@ -453,17 +482,19 @@ class BotPlayer:
                 if controller.pickup(bot_id, cx, cy):
                     self.state = States.SUBMIT_ORDER
 
-        # state 15: submit
         elif self.state == States.SUBMIT_ORDER:
             submit_pos = self.find_nearest_tile(controller, bx, by, "SUBMIT")
             ux, uy = submit_pos
-            if self.move_towards(controller, bot_id, ux, uy):
+            if controller.get_turn() > self.current_order["expires_turn"]:
+                # order expired, trash plate
+                self.state = States.TRASH_ITEM
+                return
+            elif self.move_towards(controller, bot_id, ux, uy):
                 if controller.submit(bot_id, ux, uy):
                     self.state = States.INIT
                     self.fulfilled_orders.add(self.current_order["order_id"])
                     self.current_order = None
 
-        # state 16: trash
         elif self.state == States.TRASH_ITEM:
             trash_pos = self.find_nearest_tile(controller, bx, by, "TRASH")
             if not trash_pos:
@@ -471,7 +502,8 @@ class BotPlayer:
             tx, ty = trash_pos
             if self.move_towards(controller, bot_id, tx, ty):
                 if controller.trash(bot_id, tx, ty):
-                    self.state = States.BUY_MEAT  # restart
+                    self.state = States.INIT
+                    self.current_order = None
 
         for i in range(1, len(my_bots)):
             self.my_bot_id = my_bots[i]
